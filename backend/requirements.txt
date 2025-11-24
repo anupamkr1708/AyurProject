@@ -1,0 +1,20 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# RAG dependencies
+transformers==4.36.2
+sentence-transformers==2.5.1
+accelerate==0.26.0
+huggingface_hub==0.21.4
+
+# Pinecone
+pinecone-client==3.0.0
+pinecone
+
+# Torch (CPU version or GPU)
+torch==2.2.0       # use this unless you have CUDA
+
+# Utility
+python-dotenv==1.0.0
+numpy
