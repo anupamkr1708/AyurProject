@@ -1,0 +1,18 @@
+# env
+.env
+backend/.env
+
+# cache
+__pycache__/
+*.pyc
+
+# artifacts
+*.pkl
+
+# local datasets
+final_dataset.py
+.env
+backend/.env
+__pycache__/
+*.pkl
+final_dataset.py

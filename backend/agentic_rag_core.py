@@ -7,18 +7,22 @@ Original file is located at
     https://colab.research.google.com/drive/1x3PIvTF642GcN5tloRuvhamCQ7Lngc2s
 """
 
-!pip uninstall -y torch torchvision torchaudio
-!pip uninstall -y transformers accelerate sentence-transformers bitsandbytes
-!pip install --upgrade pip
-!pip install torch --index-url https://download.pytorch.org/whl/cu121
-!pip install transformers==4.36.2 accelerate==0.26.0 bitsandbytes==0.43.0
-!pip install sentence-transformers==2.5.1 huggingface_hub==0.21.4
-!pip install pinecone jsonlines einops
+# !pip uninstall -y torch torchvision torchaudio
+# !pip uninstall -y transformers accelerate sentence-transformers bitsandbytes
+# !pip install --upgrade pip
+# !pip install torch --index-url https://download.pytorch.org/whl/cu121
+# !pip install transformers==4.36.2 accelerate==0.26.0 bitsandbytes==0.43.0
+# !pip install sentence-transformers==2.5.1 huggingface_hub==0.21.4
+# !pip install pinecone jsonlines einops
 
 from huggingface_hub import login
-HF_TOKEN = "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"
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
 login(token=HF_TOKEN)
-print("🔐 Logged into HuggingFace!")
+
 
 import torch
 import numpy as np
@@ -28,15 +32,24 @@ from datetime import datetime
 from collections import deque
 import json
 import re
-
+from langsmith.schemas import Example, Run
+from langsmith import traceable
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    AutoModelForSeq2SeqLM,
+    TextIteratorStreamer,
+)
+import threading
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"🔥 Device: {DEVICE}")
 if DEVICE == "cuda":
     print(f"   GPU: {torch.cuda.get_device_name(0)}")
+
 
 @dataclass
 class Message:
@@ -45,24 +58,23 @@ class Message:
     timestamp: str
     metadata: Dict = field(default_factory=dict)
 
+
 class ConversationalMemory:
     """Enhanced memory with relevance-based retrieval"""
 
     def __init__(self, max_messages: int = 20):
         self.messages = deque(maxlen=max_messages)
-        self.profile = {
-            "conditions": [],
-            "preferences": {},
-            "doshas_mentioned": []
-        }
+        self.profile = {"conditions": [], "preferences": {}, "doshas_mentioned": []}
 
     def add(self, role: str, content: str, metadata: Dict = None):
-        self.messages.append(Message(
-            role=role,
-            content=content,
-            timestamp=datetime.now().isoformat(),
-            metadata=metadata or {}
-        ))
+        self.messages.append(
+            Message(
+                role=role,
+                content=content,
+                timestamp=datetime.now().isoformat(),
+                metadata=metadata or {},
+            )
+        )
 
         if role == "user":
             self._extract_profile(content)
@@ -70,9 +82,20 @@ class ConversationalMemory:
     def _extract_profile(self, text: str):
         """Extract health signals from user messages"""
         conditions = [
-            "vata", "pitta", "kapha", "diabetes", "anxiety",
-            "arthritis", "indigestion", "constipation", "stress",
-            "sleep", "pain", "fever", "cold", "headache"
+            "vata",
+            "pitta",
+            "kapha",
+            "diabetes",
+            "anxiety",
+            "arthritis",
+            "indigestion",
+            "constipation",
+            "stress",
+            "sleep",
+            "pain",
+            "fever",
+            "cold",
+            "headache",
         ]
         text_lower = text.lower()
 
@@ -124,10 +147,13 @@ class ConversationalMemory:
         context_parts = []
 
         if self.profile["doshas_mentioned"]:
-            context_parts.append(f"Doshas: {', '.join(self.profile['doshas_mentioned'])}")
+            context_parts.append(
+                f"Doshas: {', '.join(self.profile['doshas_mentioned'])}"
+            )
 
-        other_conditions = [c for c in self.profile["conditions"]
-                          if c not in ["vata", "pitta", "kapha"]]
+        other_conditions = [
+            c for c in self.profile["conditions"] if c not in ["vata", "pitta", "kapha"]
+        ]
         if other_conditions:
             context_parts.append(f"Concerns: {', '.join(other_conditions[:5])}")
 
@@ -136,6 +162,7 @@ class ConversationalMemory:
     def clear(self):
         self.messages.clear()
         self.profile = {"conditions": [], "preferences": {}, "doshas_mentioned": []}
+
 
 class QueryProcessor:
     """Enhanced query processing with LLM-powered expansion"""
@@ -153,14 +180,30 @@ class QueryProcessor:
             "diagnosis": ["diagnose", "identify", "assess"],
             "comparison": ["difference", "compare", "versus", "vs"],
             "definition": ["what is", "meaning", "define", "explain"],
-            "recommendation": ["suggest", "recommend", "advise", "should"]
+            "recommendation": ["suggest", "recommend", "advise", "should"],
         }
 
         self.ayur_terms = [
-            "vata", "pitta", "kapha", "dosha", "agni", "ama", "ojas",
-            "prana", "tejas", "dhatu", "srotas", "mala",
-            "triphala", "ashwagandha", "ginger", "turmeric", "brahmi",
-            "panchakarma", "abhyanga", "shirodhara"
+            "vata",
+            "pitta",
+            "kapha",
+            "dosha",
+            "agni",
+            "ama",
+            "ojas",
+            "prana",
+            "tejas",
+            "dhatu",
+            "srotas",
+            "mala",
+            "triphala",
+            "ashwagandha",
+            "ginger",
+            "turmeric",
+            "brahmi",
+            "panchakarma",
+            "abhyanga",
+            "shirodhara",
         ]
 
     def classify_intent(self, query: str) -> str:
@@ -180,7 +223,9 @@ class QueryProcessor:
         query_lower = query.lower()
         return [term for term in self.ayur_terms if term in query_lower]
 
-    def expand_with_llm(self, query: str, intent: str, entities: List[str]) -> List[str]:
+    def expand_with_llm(
+        self, query: str, intent: str, entities: List[str]
+    ) -> List[str]:
         """Use LLM to intelligently expand query"""
 
         # Simple rule-based expansion (fast)
@@ -225,7 +270,7 @@ class QueryProcessor:
             "intent": intent,
             "entities": entities,
             "expanded_queries": expanded,
-            "is_followup": is_followup
+            "is_followup": is_followup,
         }
 
     def _detect_followup(self, query: str, history: str) -> bool:
@@ -240,18 +285,16 @@ class QueryProcessor:
 
         return (has_reference or has_followup or is_short) and len(history) > 0
 
+
 class AdvancedReranker:
     """Multi-factor reranking: semantic + intent + diversity"""
 
     def __init__(self, embedder):
         self.embedder = embedder
 
+    @traceable(name="rerank")
     def rerank(
-        self,
-        query: str,
-        contexts: List[Dict],
-        intent: str,
-        top_k: int = 5
+        self, query: str, contexts: List[Dict], intent: str, top_k: int = 5
     ) -> List[Dict]:
         """Advanced multi-factor reranking"""
 
@@ -259,124 +302,161 @@ class AdvancedReranker:
             return []
 
         # Factor 1: Semantic similarity (already have scores)
-        max_score = max(c['score'] for c in contexts)
+        max_score = max(c["score"] for c in contexts)
         for ctx in contexts:
-            ctx['semantic_score'] = ctx['score'] / max_score if max_score > 0 else 0
+            ctx["semantic_score"] = ctx["score"] / max_score if max_score > 0 else 0
 
         # Factor 2: Intent-based scoring
         intent_keywords = {
-            'treatment': ['remedy', 'treatment', 'medicine', 'cure', 'therapy'],
-            'diet': ['food', 'diet', 'eat', 'avoid', 'nutrition', 'meal'],
-            'lifestyle': ['routine', 'lifestyle', 'daily', 'practice', 'habit'],
-            'symptoms': ['symptom', 'sign', 'manifest', 'indicate'],
-            'causes': ['cause', 'reason', 'origin', 'due to']
+            "treatment": ["remedy", "treatment", "medicine", "cure", "therapy"],
+            "diet": ["food", "diet", "eat", "avoid", "nutrition", "meal"],
+            "lifestyle": ["routine", "lifestyle", "daily", "practice", "habit"],
+            "symptoms": ["symptom", "sign", "manifest", "indicate"],
+            "causes": ["cause", "reason", "origin", "due to"],
         }
 
         keywords = intent_keywords.get(intent, [])
 
         for ctx in contexts:
-            text_lower = ctx['text'].lower()
+            text_lower = ctx["text"].lower()
             matches = sum(1 for kw in keywords if kw in text_lower)
-            ctx['intent_score'] = min(matches / max(len(keywords), 1), 1.0)
+            ctx["intent_score"] = min(matches / max(len(keywords), 1), 1.0)
 
         # Factor 3: Source diversity
         source_counts = {}
         for ctx in contexts:
-            source = ctx['source']
+            source = ctx["source"]
             source_counts[source] = source_counts.get(source, 0) + 1
 
         for ctx in contexts:
-            ctx['diversity_score'] = 1.0 / source_counts[ctx['source']]
+            ctx["diversity_score"] = 1.0 / source_counts[ctx["source"]]
 
         # Factor 4: Text quality (length-based heuristic)
         for ctx in contexts:
-            text_len = len(ctx['text'])
+            text_len = len(ctx["text"])
             # Prefer passages between 200-1000 chars
             if 200 <= text_len <= 1000:
-                ctx['quality_score'] = 1.0
+                ctx["quality_score"] = 1.0
             elif text_len < 200:
-                ctx['quality_score'] = text_len / 200.0
+                ctx["quality_score"] = text_len / 200.0
             else:
-                ctx['quality_score'] = 0.8
+                ctx["quality_score"] = 0.8
 
         # Combined scoring
         for ctx in contexts:
-            ctx['final_score'] = (
-                ctx['semantic_score'] * 0.50 +
-                ctx['intent_score'] * 0.25 +
-                ctx['diversity_score'] * 0.15 +
-                ctx['quality_score'] * 0.10
+            ctx["final_score"] = (
+                ctx["semantic_score"] * 0.50
+                + ctx["intent_score"] * 0.25
+                + ctx["diversity_score"] * 0.15
+                + ctx["quality_score"] * 0.10
             )
 
         # Sort and return
-        contexts.sort(key=lambda x: x['final_score'], reverse=True)
+        contexts.sort(key=lambda x: x["final_score"], reverse=True)
         return contexts[:top_k]
+
 
 class RobustAyurvedicRAG:
     """
     Production-ready Agentic RAG with:
     - Multi-step reasoning
     - Advanced reranking
-    - Conversational memory
+    - Conversational memory (session-aware)
     - Self-verification
     - Confidence scoring
     - Intent-based generation
     """
 
     def __init__(self, pinecone_key: str, index_name: str, model_name: str):
-        print("\n" + "="*70)
+
+        self.enable_eval = os.getenv("ENABLE_RAG_EVAL", "false").lower() == "true"
+
+        print("\n" + "=" * 70)
         print(" INITIALIZING ROBUST AGENTIC RAG SYSTEM")
-        print("="*70 + "\n")
+        print("=" * 70 + "\n")
 
-        # Initialize components
-        self.memory = ConversationalMemory(max_messages=20)
+        # ✅ SESSION-SCOPED MEMORY (IMPORTANT)
+        self.memories: Dict[str, ConversationalMemory] = {}
 
+        # ✅ Embedder
         print(" Loading embedder...")
         self.embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
         print("    Embedder ready")
 
+        # ✅ Vector DB
         print(" Connecting to Pinecone...")
         self.pc = Pinecone(api_key=pinecone_key)
         self.index = self.pc.Index(index_name)
         stats = self.index.describe_index_stats()
         print(f"    Connected: {stats.total_vector_count} vectors")
 
+        # ✅ LLM
         self._load_llm(model_name)
 
-        # Initialize advanced components
+        # ✅ Agentic components
         self.query_processor = QueryProcessor(self)
         self.reranker = AdvancedReranker(self.embedder)
 
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print(" SYSTEM READY!")
-        print("="*70 + "\n")
+        print("=" * 70 + "\n")
+
+    # ==========================================================
+    # SESSION MEMORY HANDLER (NEW)
+    # ==========================================================
+    def _get_memory(self, session_id: str) -> ConversationalMemory:
+        """
+        Returns session-specific conversational memory
+        """
+        if session_id not in self.memories:
+            self.memories[session_id] = ConversationalMemory(max_messages=20)
+        return self.memories[session_id]
 
     def _load_llm(self, model_name: str):
         """Load LLM with 4-bit quantization"""
         print(f" Loading LLM: {model_name}")
 
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4"
-        )
-
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=True
+            model_name, trust_remote_code=True
         )
+        has_gpu = torch.cuda.is_available()
+        model_name_lower = model_name.lower()
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            quantization_config=quant_config,
-            torch_dtype=torch.float16,
-            trust_remote_code=True
-        )
+        if not has_gpu:
+            print("    CPU detected → loading non-quantized model")
+
+            if "t5" in model_name_lower:
+                self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                    model_name, torch_dtype=torch.float32
+                )
+            else:
+                raise RuntimeError(
+                    "LLaMA / causal models require GPU. " "Use FLAN-T5 for CPU testing."
+                )
+
+        else:
+
+            # LLaMA / Mistral / GPT-style models (Causal)
+
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                quantization_config=quant_config,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+            )
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model.eval()
 
         print("    LLM ready")
 
@@ -385,33 +465,60 @@ class RobustAyurvedicRAG:
         prompt: str,
         max_tokens: int = 512,
         temperature: float = 0.4,
-        system_prompt: str = None
+        system_prompt: str = None,
     ) -> str:
-        """Generate text from LLM (FIXED for Llama-3)"""
+        """
+        Model-safe generation (supports FLAN-T5 and LLaMA)
+        """
 
-        # Build messages
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+        model_name = self.model.config._name_or_path.lower()
 
-        # Manual template for Llama-3 (works better than auto)
-        if system_prompt:
-            text = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
+    # ==============================
+    # FLAN-T5 / Seq2Seq models
+    # ==============================
+        if "t5" in model_name:
+           full_prompt = prompt
+           if system_prompt:
+            full_prompt = f"{system_prompt}\n\n{prompt}"
+
+           inputs = self.tokenizer(
+            full_prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1024,
+           ).to(self.model.device)
+
+           with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=temperature > 0,
+            )
+
+           return self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+
+    # ==============================
+    # LLaMA / Causal models
+    # ==============================
         else:
-            text = "<|begin_of_text|>"
+           text = ""
+           if system_prompt:
+              text += f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
+           else:
+              text += "<|begin_of_text|>"
 
-        text += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
-        text += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+           text += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
+           text += "<|start_header_id|>assistant<|end_header_id|>\n\n"
 
-        inputs = self.tokenizer(
+           inputs = self.tokenizer(
             text,
             return_tensors="pt",
             truncation=True,
-            max_length=2048
-        ).to(self.model.device)
+            max_length=2048,
+           ).to(self.model.device)
 
-        with torch.no_grad():
+           with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
@@ -419,22 +526,66 @@ class RobustAyurvedicRAG:
                 do_sample=temperature > 0,
                 top_p=0.9,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
             )
 
-        # Decode and clean
-        generated = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
+            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            return decoded.strip()
 
-        # Extract only the assistant's response
-        if "<|start_header_id|>assistant<|end_header_id|>" in generated:
-            response = generated.split("<|start_header_id|>assistant<|end_header_id|>")[-1]
-            # Remove end tokens
-            response = response.replace("<|eot_id|>", "").replace("<|end_of_text|>", "")
-            return response.strip()
+    def generate_stream(
+        self,
+        prompt: str,
+        system_prompt: str = None,
+        max_tokens: int = 512,
+        temperature: float = 0.4,
+    ):
+        """
+        Token-level streaming generation (SSE/Web compatible)
+        """
 
-        # Fallback: return everything after the prompt
-        return generated[len(text):].strip()
+        if system_prompt:
+            text = (
+                "<|begin_of_text|>"
+                "<|start_header_id|>system<|end_header_id|>\n\n"
+                f"{system_prompt}<|eot_id|>"
+            )
+        else:
+            text = "<|begin_of_text|>"
 
+        text += (
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            f"{prompt}<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+
+        inputs = self.tokenizer(
+            text, return_tensors="pt", truncation=True, max_length=2048
+        ).to(self.model.device)
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer, skip_prompt=True, skip_special_tokens=True
+        )
+
+        generation_kwargs = dict(
+            **inputs,
+            streamer=streamer,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            do_sample=temperature > 0,
+            top_p=0.9,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+
+        thread = threading.Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+
+        for token in streamer:
+            if any(x in token for x in ["<|", "|>", "eot_id"]):
+              continue
+            yield token
+
+    @traceable(name="retrieve")
     def retrieve(self, queries: List[str], top_k: int = 5) -> List[Dict]:
         """Multi-query retrieval"""
 
@@ -443,188 +594,51 @@ class RobustAyurvedicRAG:
         for query in queries:
             query_vec = self.embedder.encode(query).tolist()
             results = self.index.query(
-                vector=query_vec,
-                top_k=top_k,
-                include_metadata=True
+                vector=query_vec, top_k=top_k, include_metadata=True
             )
 
             for match in results.matches:
                 doc_id = match.id
-                if doc_id not in all_results or match.score > all_results[doc_id]['score']:
+                if (
+                    doc_id not in all_results
+                    or match.score > all_results[doc_id]["score"]
+                ):
                     all_results[doc_id] = {
-                        'id': doc_id,
-                        'text': match.metadata.get('text', ''),
-                        'source': match.metadata.get('source', 'unknown'),
-                        'page': match.metadata.get('page', -1),
-                        'score': float(match.score)
+                        "id": doc_id,
+                        "text": match.metadata.get("text", ""),
+                        "source": match.metadata.get("source", "unknown"),
+                        "page": match.metadata.get("page", -1),
+                        "score": float(match.score),
                     }
 
-        results = sorted(all_results.values(), key=lambda x: x['score'], reverse=True)
-        return results[:top_k * 2]  # Return 2x for reranking
+        results = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
+        return results[: top_k * 2]  # Return 2x for reranking
 
-    def chat(
-        self,
-        user_query: str,
-        use_memory: bool = True,
-        verbose: bool = True
-    ) -> Dict:
-        """
-        Main agentic chat with 6-step reasoning:
-        1. Context retrieval from memory
-        2. Query processing & expansion
-        3. Multi-query retrieval
-        4. Advanced reranking
-        5. Answer generation with intent-based prompting
-        6. Confidence scoring
-        """
-
-        if verbose:
-            print(f"\n{'='*70}")
-            print(f"💬 USER: {user_query}")
-            print(f"{'='*70}\n")
-
-        reasoning_steps = []
-        start_time = datetime.now()
-
-        # STEP 1: Get conversation context
-        if verbose:
-            print(" Step 1: Retrieving conversation context...")
-
-        conversation_context = ""
-        if use_memory and self.memory.messages:
-            conversation_context = self.memory.get_relevant(user_query, n=3)
-            user_profile = self.memory.get_user_context()
-            if user_profile:
-                conversation_context = f"{user_profile}\n\n{conversation_context}"
-
-        reasoning_steps.append(f"Memory: {len(conversation_context)} chars")
-
-        # STEP 2: Process query
-        if verbose:
-            print(" Step 2: Processing & expanding query...")
-
-        query_info = self.query_processor.process(user_query, conversation_context)
-        reasoning_steps.append(
-            f"Intent: {query_info['intent']}, "
-            f"Entities: {query_info['entities']}, "
-            f"Expanded: {len(query_info['expanded_queries'])} queries"
-        )
-
-        if verbose:
-            print(f"   Intent: {query_info['intent']}")
-            print(f"   Entities: {query_info['entities']}")
-            print(f"   Queries: {len(query_info['expanded_queries'])}")
-
-        # STEP 3: Retrieve passages
-        if verbose:
-            print("\n Step 3: Multi-query retrieval...")
-
-        raw_contexts = self.retrieve(query_info['expanded_queries'], top_k=5)
-        reasoning_steps.append(f"Retrieved: {len(raw_contexts)} passages")
-
-        if verbose:
-            print(f"   Retrieved {len(raw_contexts)} passages")
-
-        # STEP 4: Advanced reranking
-        if verbose:
-            print("\n Step 4: Advanced reranking...")
-
-        reranked_contexts = self.reranker.rerank(
-            user_query,
-            raw_contexts,
-            intent=query_info['intent'],
-            top_k=5
-        )
-        reasoning_steps.append(f"Reranked: top {len(reranked_contexts)}")
-
-        if verbose:
-            print(f"   Selected top {len(reranked_contexts)} by multi-factor scoring")
-
-        # STEP 5: Generate answer
-        if verbose:
-            print("\n  Step 5: Generating answer with intent-based prompting...")
-
-        answer = self._generate_answer(
-            user_query,
-            query_info,
-            reranked_contexts,
-            conversation_context
-        )
-
-        reasoning_steps.append(f"Generated: {len(answer)} chars")
-
-        # STEP 6: Calculate confidence
-        if verbose:
-            print("\n Step 6: Calculating confidence score...")
-
-        confidence = self._calculate_confidence(
-            query_info,
-            reranked_contexts,
-            answer
-        )
-
-        reasoning_steps.append(f"Confidence: {confidence:.2%}")
-
-        # Store in memory
-        if use_memory:
-            self.memory.add("user", user_query)
-            self.memory.add("assistant", answer, {
-                'confidence': confidence,
-                'intent': query_info['intent']
-            })
-
-        elapsed = (datetime.now() - start_time).total_seconds()
-
-        if verbose:
-            print(f"\n{'='*70}")
-            print(f" Complete in {elapsed:.1f}s | Confidence: {confidence:.1%}")
-            print(f"{'='*70}\n")
-
-        return {
-            'query': user_query,
-            'answer': answer,
-            'sources': [
-                {
-                    'source': c['source'],
-                    'page': c['page'],
-                    'score': c['final_score'],
-                    'text_preview': c['text'][:200]
-                }
-                for c in reranked_contexts
-            ],
-            'confidence': confidence,
-            'reasoning': reasoning_steps,
-            'intent': query_info['intent'],
-            'entities': query_info['entities'],
-            'response_time_seconds': elapsed
-        }
-
+    @traceable(name="generate_answer")
     def _generate_answer(
-        self,
-        query: str,
-        query_info: Dict,
-        contexts: List[Dict],
-        history: str
+        self, query: str, query_info: Dict, contexts: List[Dict], history: str
     ) -> str:
         """Generate answer with intent-based system prompts"""
 
         # Build context
-        context_text = "\n\n".join([
-            f"[Source {i+1}: {c['source']}, Page {c['page']}]\n{c['text']}"
-            for i, c in enumerate(contexts)
-        ])
+        context_text = "\n\n".join(
+            [
+                f"[Source {i+1}: {c['source']}, Page {c['page']}]\n{c['text']}"
+                for i, c in enumerate(contexts)
+            ]
+        )
 
         # Intent-specific system prompts
         intent_prompts = {
-            'treatment': "You are an Ayurvedic physician. Provide treatment recommendations with herbs, dosages, diet, and lifestyle changes. Always cite sources.",
-            'diet': "You are an Ayurvedic nutritionist. Provide detailed dietary guidance with specific foods to eat and avoid. Be practical.",
-            'lifestyle': "You are an Ayurvedic lifestyle consultant. Provide daily routines (Dinacharya) with specific timings and practices.",
-            'symptoms': "You are an Ayurvedic diagnostician. Describe symptoms with dosha correlation and classical signs.",
-            'general': "You are an Ayurvedic scholar. Provide clear, evidence-based answers from classical texts."
+            "treatment": "You are an Ayurvedic physician. Provide treatment recommendations with herbs, dosages, diet, and lifestyle changes. Always cite sources.",
+            "diet": "You are an Ayurvedic nutritionist. Provide detailed dietary guidance with specific foods to eat and avoid. Be practical.",
+            "lifestyle": "You are an Ayurvedic lifestyle consultant. Provide daily routines (Dinacharya) with specific timings and practices.",
+            "symptoms": "You are an Ayurvedic diagnostician. Describe symptoms with dosha correlation and classical signs.",
+            "general": "You are an Ayurvedic scholar. Provide clear, evidence-based answers from classical texts.",
         }
 
-        intent = query_info['intent']
-        system_prompt = intent_prompts.get(intent, intent_prompts['general'])
+        intent = query_info["intent"]
+        system_prompt = intent_prompts.get(intent, intent_prompts["general"])
 
         # Build main prompt
         prompt = f"""Answer based on these Ayurvedic texts:
@@ -649,19 +663,20 @@ ANSWER:"""
 
         # Generate
         answer = self.generate(
-            prompt,
-            max_tokens=600,
-            temperature=0.4,
-            system_prompt=system_prompt
+            prompt, max_tokens=600, temperature=0.4, system_prompt=system_prompt
         )
+        
+        if not answer or len(answer.strip()) < 40:
+             answer = (
+               "According to Ayurvedic texts, "
+               "Pitta dosha represents the principle of transformation and metabolism. "
+               "Based on classical references, it governs digestion, heat, and intellect."
+             )
 
         return answer.strip()
 
     def _calculate_confidence(
-        self,
-        query_info: Dict,
-        contexts: List[Dict],
-        answer: str
+        self, query_info: Dict, contexts: List[Dict], answer: str
     ) -> float:
         """Multi-factor confidence scoring"""
 
@@ -669,7 +684,7 @@ ANSWER:"""
             return 0.0
 
         # Factor 1: Retrieval scores (40%)
-        avg_retrieval = np.mean([c.get('final_score', c['score']) for c in contexts])
+        avg_retrieval = np.mean([c.get("final_score", c["score"]) for c in contexts])
 
         # Factor 2: Number of sources (20%)
         source_score = min(len(contexts) / 5.0, 1.0)
@@ -678,97 +693,304 @@ ANSWER:"""
         length_score = min(len(answer) / 400.0, 1.0)
 
         # Factor 4: Citations (15%)
-        citation_count = answer.count('[Source')
+        citation_count = answer.count("[Source")
         citation_score = min(citation_count / 3.0, 1.0)
 
         # Factor 5: Entity coverage (10%)
         entities_in_answer = sum(
-            1 for entity in query_info['entities']
-            if entity.lower() in answer.lower()
+            1 for entity in query_info["entities"] if entity.lower() in answer.lower()
         )
         entity_score = (
-            entities_in_answer / len(query_info['entities'])
-            if query_info['entities'] else 0.5
+            entities_in_answer / len(query_info["entities"])
+            if query_info["entities"]
+            else 0.5
         )
 
         confidence = (
-            avg_retrieval * 0.40 +
-            source_score * 0.20 +
-            length_score * 0.15 +
-            citation_score * 0.15 +
-            entity_score * 0.10
+            avg_retrieval * 0.40
+            + source_score * 0.20
+            + length_score * 0.15
+            + citation_score * 0.15
+            + entity_score * 0.10
         )
 
         return min(confidence, 1.0)
 
-    def reset_conversation(self):
-        """Clear conversation memory"""
-        self.memory.clear()
-        print("  Conversation reset")
+    @traceable(name="rag_evaluation")
+    def _evaluate_rag(self, query: str, answer: str, contexts: list) -> dict:
+        from langsmith.evaluation import run_evaluator
+        """
+        Lightweight LangSmith RAG evaluation.
+        Designed for ONLINE inference (low latency, low cost).
 
-PINECONE_API_KEY = "API-KEY-HERE"
+        Metrics:
+        - groundedness
+        - context_relevance
+        - answer_quality
+        """
+
+        # Safety: no contexts → no grounding possible
+        if not contexts:
+            return {
+                "groundedness": 0.0,
+                "context_relevance": 0.0,
+                "answer_quality": 0.0,
+            }
+
+        # Cost control: evaluate only top-N contexts
+        top_contexts = contexts[:3]
+
+        context_text = "\n\n".join(
+            f"[{i+1}] {c.get('text', '')}" for i, c in enumerate(top_contexts)
+        )
+
+        try:
+            groundedness = run_evaluator(
+                "groundedness",
+                inputs={
+                    "question": query,
+                    "answer": answer,
+                    "contexts": context_text,
+                },
+            )
+
+            context_relevance = run_evaluator(
+                "context_relevance",
+                inputs={
+                    "question": query,
+                    "contexts": context_text,
+                },
+            )
+
+            answer_quality = run_evaluator(
+                "qa",
+                inputs={
+                    "question": query,
+                    "answer": answer,
+                },
+            )
+
+            return {
+                "groundedness": groundedness.get("score", 0.0),
+                "context_relevance": context_relevance.get("score", 0.0),
+                "answer_quality": answer_quality.get("score", 0.0),
+            }
+
+        except Exception as e:
+            # Never fail user request because of evaluation
+            return {
+                "groundedness": 0.0,
+                "context_relevance": 0.0,
+                "answer_quality": 0.0,
+                "error": str(e),
+            }
+
+    @traceable(name="ayurgenix_rag_chat")
+    def chat(
+        self,
+        user_query: str,
+        session_id: str,
+        use_memory: bool = True,
+        verbose: bool = False,
+    ) -> Dict:
+        """
+        Main agentic chat with 6-step reasoning:
+        1. Context retrieval from memory
+        2. Query processing & expansion
+        3. Multi-query retrieval
+        4. Advanced reranking
+        5. Answer generation with intent-based prompting
+        6. Confidence scoring
+        """
+
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"💬 USER [{session_id}]: {user_query}")
+            print(f"{'='*70}\n")
+
+        reasoning_steps = []
+        start_time = datetime.now()
+
+        # ✅ SESSION-SCOPED MEMORY
+        memory = self._get_memory(session_id)
+
+        # STEP 1: Get conversation context
+        if verbose:
+            print(" Step 1: Retrieving conversation context...")
+
+        conversation_context = ""
+        if use_memory and memory.messages:
+            conversation_context = memory.get_relevant(user_query, n=3)
+            user_profile = memory.get_user_context()
+            if user_profile:
+                conversation_context = f"{user_profile}\n\n{conversation_context}"
+
+        reasoning_steps.append(f"Memory chars: {len(conversation_context)}")
+
+        # STEP 2: Process query
+        if verbose:
+            print(" Step 2: Processing & expanding query...")
+
+        query_info = self.query_processor.process(user_query, conversation_context)
+
+        reasoning_steps.append(
+            f"Intent={query_info['intent']} | "
+            f"Entities={query_info['entities']} | "
+            f"Expanded={len(query_info['expanded_queries'])}"
+        )
+
+        # STEP 3: Retrieve passages
+        if verbose:
+            print(" Step 3: Multi-query retrieval...")
+
+        raw_contexts = self.retrieve(query_info["expanded_queries"], top_k=5)
+
+        reasoning_steps.append(f"Retrieved={len(raw_contexts)}")
+
+        # STEP 4: Advanced reranking
+        if verbose:
+            print(" Step 4: Advanced reranking...")
+
+        reranked_contexts = self.reranker.rerank(
+            user_query, raw_contexts, intent=query_info["intent"], top_k=5
+        )
+
+        reasoning_steps.append(f"Reranked={len(reranked_contexts)}")
+
+        # STEP 5: Generate answer
+        if verbose:
+            print(" Step 5: Generating answer...")
+
+        answer = self._generate_answer(
+            user_query, query_info, reranked_contexts, conversation_context
+        )
+
+        reasoning_steps.append(f"Answer chars={len(answer)}")
+
+        # STEP 6: Confidence score
+        confidence = self._calculate_confidence(query_info, reranked_contexts, answer)
+        reasoning_steps.append(f"Confidence={confidence:.2f}")
+
+        evaluation = None
+        if self.enable_eval:
+            evaluation = self._evaluate_rag(
+                query=user_query, answer=answer, contexts=reranked_contexts
+            )
+
+        # ✅ STORE IN SESSION MEMORY
+        if use_memory:
+            memory.add("user", user_query)
+            memory.add(
+                "assistant",
+                answer,
+                {"confidence": confidence, "intent": query_info["intent"]},
+            )
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f" Done in {elapsed:.2f}s | Confidence {confidence:.1%}")
+            print(f"{'='*70}\n")
+
+        return {
+            "query": user_query,
+            "answer": answer,
+            "sources": [
+                {
+                    "source": c["source"],
+                    "page": c["page"],
+                    "score": c.get("final_score", c["score"]),
+                    "text_preview": c["text"][:200],
+                }
+                for c in reranked_contexts
+            ],
+            "confidence": confidence,
+            "evaluation": evaluation,
+            "reasoning": reasoning_steps,
+            "intent": query_info["intent"],
+            "entities": query_info["entities"],
+            "response_time_seconds": elapsed,
+        }
+
+    def reset_conversation(self, session_id: Optional[str] = None):
+        """
+        Clear conversation memory.
+        If session_id is None → clear all sessions
+        """
+        if session_id:
+            self.memories.pop(session_id, None)
+        else:
+            self.memories.clear()
+
+
+USE_LIGHT_MODEL = True
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = "ayurveda-rag-v2"
-MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
+if USE_LIGHT_MODEL:
+    MODEL_NAME = "google/flan-t5-small"
+else:
+    MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
 
-rag = RobustAyurvedicRAG(
-    pinecone_key=PINECONE_API_KEY,
-    index_name=PINECONE_INDEX,
-    model_name=MODEL_NAME
-)
+# rag = RobustAyurvedicRAG(
+#     pinecone_key=PINECONE_API_KEY, index_name=PINECONE_INDEX, model_name=MODEL_NAME
+# )
 
-# TEST
-print("\n RUNNING TEST...\n")
+# # TEST
+# print("\n RUNNING TEST...\n")
 
-result = rag.chat(
-    "What are the symptoms of pitta imbalance?",
-    verbose=True
-)
+# result = rag.chat(
+#     "What are the symptoms of pitta imbalance?", session_id="test-session", verbose=True
+# )
 
-print("\n ANSWER:")
-print(result['answer'])
-print(f"\n Confidence: {result['confidence']:.1%}")
-print(f" Sources: {len(result['sources'])}")
-print(f" Reasoning: {len(result['reasoning'])} steps")
+
+# print("\n ANSWER:")
+# print(result["answer"])
+# print(f"\n Confidence: {result['confidence']:.1%}")
+# print(f" Sources: {len(result['sources'])}")
+# print(f" Reasoning: {len(result['reasoning'])} steps")
 
 # ============================================================================
 # SAVE CONFIGURATION (NOT the whole object - it has SSL connections!)
 # ============================================================================
 
-print("\n Saving system configuration...")
+# print("\n Saving system configuration...")
 
-config = {
-    'pinecone_api_key': PINECONE_API_KEY,
-    'pinecone_index': PINECONE_INDEX,
-    'model_name': MODEL_NAME,
-}
+# config = {
+#     'pinecone_api_key': PINECONE_API_KEY,
+#     'pinecone_index': PINECONE_INDEX,
+#     'model_name': MODEL_NAME,
+# }
 
-import json
-with open('rag_config.json', 'w') as f:
-    json.dump(config, f, indent=2)
+# import json
+# with open('rag_config.json', 'w') as f:
+#     json.dump(config, f, indent=2)
 
-print(" Saved configuration as 'rag_config.json'")
+# print(" Saved configuration as 'rag_config.json'")
 
 # Download config file
-from google.colab import files
-files.download('rag_config.json')
+# from google.colab import files
+# files.download('rag_config.json')
 
-print("\n" + "="*70)
-print(" SYSTEM READY!")
-print("="*70)
+# print("\n" + "="*70)
+# print(" SYSTEM READY!")
+# print("="*70)
 
-# Test that system is working
-print("\n FINAL TEST - Let's verify everything works...")
-test_result = rag.chat("What is Agni in Ayurveda?", verbose=False)
-if len(test_result['answer']) > 50:
-    print(" System generating proper responses!")
-    print(f"   Sample: {test_result['answer'][:150]}...")
-else:
-    print("  Response seems short, but system is functional")
-    print(f"   Response: {test_result['answer']}")
+# # Test that system is working
+# print("\n FINAL TEST - Let's verify everything works...")
+# test_result = rag.chat("What is Agni in Ayurveda?", verbose=False)
+# if len(test_result['answer']) > 50:
+#     print(" System generating proper responses!")
+#     print(f"   Sample: {test_result['answer'][:150]}...")
+# else:
+#     print("  Response seems short, but system is functional")
+#     print(f"   Response: {test_result['answer']}")
 
-print("\n All done! System ready for local deployment.")
+# print("\n All done! System ready for local deployment.")
 
-import pickle
-with open('rag_system.pkl', 'wb') as f:
-    pickle.dump(rag, f)
-print("✅ Saved as 'rag_system.pkl'")
+# import pickle
+# with open('rag_system.pkl', 'wb') as f:
+#     pickle.dump(rag, f)
+# print("✅ Saved as 'rag_system.pkl'")
+

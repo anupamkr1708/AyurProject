@@ -1,253 +1,298 @@
 """
-Streamlit Frontend for Ayurvedic RAG
+🌿 Ayurvedic AI Assistant – Production Streamlit Frontend
+Compatible with Agentic RAG + FastAPI backend
 Run: streamlit run app.py
 """
 
 import streamlit as st
 import requests
-from datetime import datetime
 import uuid
+import time
+from typing import Dict, List
 
-# ============================================================================
+# =============================================================================
 # CONFIG
-# ============================================================================
+# =============================================================================
 
 API_URL = "http://localhost:8000"
+REQUEST_TIMEOUT = 90  # seconds
 
 st.set_page_config(
     page_title="🌿 Ayurvedic AI Assistant",
     page_icon="🌿",
-    layout="wide"
+    layout="wide",
 )
 
-# ============================================================================
-# CUSTOM CSS
-# ============================================================================
+# =============================================================================
+# STYLES
+# =============================================================================
 
-st.markdown("""
+st.markdown(
+    """
 <style>
-    .big-title {
-        font-size: 3rem;
-        font-weight: 800;
-        color: #2E7D32;
-        text-align: center;
-        padding: 2rem;
-        background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%);
-        border-radius: 20px;
-        margin-bottom: 2rem;
-    }
-    
-    .user-msg {
-        background: linear-gradient(135deg, #E3F2FD 0%, #BBDEFB 100%);
-        padding: 1.5rem;
-        border-radius: 15px 15px 5px 15px;
-        margin: 1rem 0;
-        border-left: 5px solid #2196F3;
-    }
-    
-    .assistant-msg {
-        background: linear-gradient(135deg, #F1F8E9 0%, #DCEDC8 100%);
-        padding: 1.5rem;
-        border-radius: 15px 15px 15px 5px;
-        margin: 1rem 0;
-        border-left: 5px solid #4CAF50;
-    }
-    
-    .conf-high { color: #4CAF50; font-weight: bold; }
-    .conf-medium { color: #FF9800; font-weight: bold; }
-    .conf-low { color: #F44336; font-weight: bold; }
+.big-title {
+    font-size: 2.8rem;
+    font-weight: 800;
+    color: #1B5E20;
+    text-align: center;
+    padding: 1.8rem;
+    background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%);
+    border-radius: 18px;
+    margin-bottom: 2rem;
+}
+
+.user-msg {
+    background: #E3F2FD;
+    padding: 1.2rem;
+    border-radius: 14px;
+    margin: 1rem 0;
+    border-left: 6px solid #2196F3;
+}
+
+.assistant-msg {
+    background: #F1F8E9;
+    padding: 1.2rem;
+    border-radius: 14px;
+    margin: 1rem 0;
+    border-left: 6px solid #4CAF50;
+}
+
+.conf-high { color: #2E7D32; font-weight: bold; }
+.conf-medium { color: #EF6C00; font-weight: bold; }
+.conf-low { color: #C62828; font-weight: bold; }
+
+.source-box {
+    background: #FAFAFA;
+    padding: 0.8rem;
+    border-radius: 10px;
+    border-left: 4px solid #9CCC65;
+    margin-bottom: 0.6rem;
+}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# ============================================================================
+# =============================================================================
 # SESSION STATE
-# ============================================================================
+# =============================================================================
 
-if 'session_id' not in st.session_state:
+if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
+if "messages" not in st.session_state:
+    st.session_state.messages: List[Dict] = []
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
+if "use_streaming" not in st.session_state:
+    st.session_state.use_streaming = False
 
-def check_api():
-    """Check if API is online"""
+# =============================================================================
+# BACKEND HELPERS
+# =============================================================================
+
+
+def check_backend():
     try:
         r = requests.get(f"{API_URL}/health", timeout=5)
-        return r.status_code == 200, r.json()
-    except:
+        return True, r.json()
+    except Exception:
         return False, None
 
-def send_message(query: str):
-    """Send message to API"""
-    try:
-        r = requests.post(
-            f"{API_URL}/chat",
-            json={
-                "query": query,
-                "session_id": st.session_state.session_id,
-                "use_memory": True
-            },
-            timeout=60
-        )
-        return r.json() if r.status_code == 200 else None
-    except Exception as e:
-        st.error(f"Error: {e}")
-        return None
 
-def get_confidence_badge(conf: float):
-    """Get confidence badge"""
+def send_chat(query: str):
+    payload = {
+        "query": query,
+        "session_id": st.session_state.session_id,
+        "use_memory": True,
+    }
+
+    r = requests.post(
+        f"{API_URL}/chat",
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if r.status_code != 200:
+        raise RuntimeError(r.text)
+
+    return r.json()
+
+
+def stream_chat(query: str):
+    payload = {
+        "query": query,
+        "session_id": st.session_state.session_id,
+        "use_memory": True,
+    }
+
+    with requests.post(
+        f"{API_URL}/chat/stream",
+        json=payload,
+        stream=True,
+        timeout=REQUEST_TIMEOUT,
+    ) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line:
+                continue
+            decoded = line.decode("utf-8")
+            if decoded.startswith("data: "):
+                token = decoded.replace("data: ", "")
+                if token == "[DONE]":
+                    break
+                yield token
+
+
+def confidence_badge(conf: float):
     if conf >= 0.7:
-        return "conf-high", "🟢 High", conf
+        return "conf-high", "🟢 High"
     elif conf >= 0.5:
-        return "conf-medium", "🟡 Medium", conf
-    else:
-        return "conf-low", "🔴 Low", conf
+        return "conf-medium", "🟡 Medium"
+    return "conf-low", "🔴 Low"
 
-# ============================================================================
+
+# =============================================================================
 # SIDEBAR
-# ============================================================================
+# =============================================================================
 
 with st.sidebar:
-    st.markdown("""
-    <div style='text-align: center; padding: 1rem;'>
-        <img src='https://img.icons8.com/color/96/ayurveda.png' width='100'/>
-        <h2 style='color: #2E7D32;'>Ayurvedic AI</h2>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # System status
-    st.subheader("🔌 Status")
-    is_healthy, health = check_api()
-    
-    if is_healthy:
-        st.success("✅ Online")
-        if health:
-            st.metric("Sessions", health.get('active_sessions', 0))
-            st.metric("Vectors", "26,844")
+    st.markdown("## 🌿 Ayurvedic AI")
+
+    healthy, health = check_backend()
+
+    if healthy:
+        st.success("Backend Online")
+        st.caption(f"Model: {health.get('model')}")
+        st.caption(f"Sessions: {health.get('active_sessions')}")
     else:
-        st.error("❌ Offline")
-        st.info("Start backend:\n```bash\ncd backend\npython main.py\n```")
-    
+        st.error("Backend Offline")
+        st.code("cd backend && uvicorn main:app --reload")
+
     st.markdown("---")
-    
-    # Session controls
-    st.subheader("🎛️ Controls")
-    
-    if st.button("🔄 New Chat", use_container_width=True):
+
+    st.checkbox(
+        "⚡ Streaming Response",
+        value=st.session_state.use_streaming,
+        key="use_streaming",
+    )
+
+    if st.button("🔄 New Conversation", use_container_width=True):
         st.session_state.session_id = str(uuid.uuid4())
-        st.session_state.messages = []
+        st.session_state.messages.clear()
         st.rerun()
-    
-    if st.button("🗑️ Clear", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
-    
+
     st.markdown("---")
-    
-    # Quick examples
-    st.subheader("💡 Examples")
-    examples = [
-        "What are the three doshas?",
-        "Treatment for anxiety",
-        "Diet for Pitta imbalance",
-        "Daily Ayurvedic routine"
-    ]
-    
-    for ex in examples:
-        if st.button(ex, key=f"ex_{ex}", use_container_width=True):
-            st.session_state.example_query = ex
+
+    st.markdown("### 💡 Example Questions")
+    for q in [
+        "What is pitta dosha?",
+        "Treatment for anxiety in Ayurveda",
+        "Diet for pitta imbalance",
+        "Daily dinacharya routine",
+    ]:
+        if st.button(q, use_container_width=True):
+            st.session_state.pending_query = q
             st.rerun()
 
-# ============================================================================
-# MAIN CONTENT
-# ============================================================================
+# =============================================================================
+# MAIN UI
+# =============================================================================
 
-st.markdown('<div class="big-title">🌿 Ayurvedic AI Assistant 🌿</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="big-title">🌿 Ayurvedic AI Assistant</div>', unsafe_allow_html=True
+)
 
-st.markdown("""
-<div style='text-align: center; padding: 1rem; color: #666;'>
-    <p>Ask questions about Ayurveda and receive expert guidance from classical texts</p>
-    <p><em>Powered by Agentic RAG with Multi-Step Reasoning</em></p>
-</div>
-""", unsafe_allow_html=True)
+st.caption("Agentic RAG • Classical Texts • Confidence Scoring • Conversational Memory")
 
-# Display chat history
+# =============================================================================
+# CHAT HISTORY
+# =============================================================================
+
 for msg in st.session_state.messages:
-    if msg['role'] == 'user':
-        st.markdown(f'<div class="user-msg"><strong>You:</strong><br>{msg["content"]}</div>', 
-                   unsafe_allow_html=True)
+    if msg["role"] == "user":
+        st.markdown(
+            f"<div class='user-msg'><b>You</b><br>{msg['content']}</div>",
+            unsafe_allow_html=True,
+        )
     else:
-        cls, label, conf = get_confidence_badge(msg.get('confidence', 0))
-        st.markdown(f'''
-        <div class="assistant-msg">
-            <strong>Assistant:</strong> <span class="{cls}">{label} ({conf:.1%})</span><br><br>
-            {msg["content"]}
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        # Sources
-        if msg.get('sources'):
-            with st.expander(f"📚 {len(msg['sources'])} Sources"):
-                for i, src in enumerate(msg['sources'], 1):
-                    st.markdown(f"**{i}. {src['source']}** (Page {src['page']}) - Score: {src['score']:.2f}")
-                    st.caption(src['text_preview'])
+        cls, label = confidence_badge(msg["confidence"])
+        st.markdown(
+            f"""
+            <div class='assistant-msg'>
+            <b>Assistant</b> — <span class='{cls}'>{label} ({msg['confidence']:.1%})</span>
+            <br><br>{msg['content']}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-# Chat input
+        if msg.get("sources"):
+            with st.expander(f"📚 Sources ({len(msg['sources'])})"):
+                for s in msg["sources"]:
+                    st.markdown(
+                        f"""
+                        <div class='source-box'>
+                        <b>{s['source']}</b> (Page {s['page']})<br>
+                        Score: {s['score']:.2f}<br>
+                        <small>{s['text_preview']}</small>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+# =============================================================================
+# INPUT
+# =============================================================================
+
 st.markdown("---")
 
-col1, col2 = st.columns([5, 1])
+user_query = st.text_area(
+    "Ask your question",
+    height=90,
+    value=st.session_state.pop("pending_query", ""),
+)
 
-with col1:
-    user_input = st.text_area(
-        "Your Question:",
-        height=100,
-        placeholder="Ask about doshas, treatments, diet, lifestyle...",
-        value=st.session_state.get('example_query', ''),
-        key="chat_input"
-    )
-    
-    # Clear example
-    if 'example_query' in st.session_state:
-        del st.session_state.example_query
+send = st.button("🚀 Ask", disabled=not healthy)
 
-with col2:
-    st.write("")
-    st.write("")
-    send_btn = st.button("🚀 Send", type="primary", use_container_width=True, disabled=not is_healthy)
+if send and user_query.strip():
 
-if send_btn and user_input.strip():
-    # Add user message
-    st.session_state.messages.append({
-        'role': 'user',
-        'content': user_input
-    })
-    
-    # Get response
+    st.session_state.messages.append({"role": "user", "content": user_query})
+
     with st.spinner("🧠 Thinking..."):
-        result = send_message(user_input)
-        
-        if result:
-            st.session_state.messages.append({
-                'role': 'assistant',
-                'content': result['answer'],
-                'confidence': result['confidence'],
-                'sources': result['sources']
-            })
-    
+        try:
+            if st.session_state.use_streaming:
+                placeholder = st.empty()
+                full_answer = ""
+
+                for token in stream_chat(user_query):
+                    full_answer += token
+                    placeholder.markdown(full_answer)
+
+                result = {
+                    "answer": full_answer,
+                    "confidence": 0.5,
+                    "sources": [],
+                }
+            else:
+                result = send_chat(user_query)
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": result["answer"],
+                    "confidence": result.get("confidence", 0.5),
+                    "sources": result.get("sources", []),
+                }
+            )
+
+        except Exception as e:
+            st.error(str(e))
+
     st.rerun()
 
-# Footer
+# =============================================================================
+# FOOTER
+# =============================================================================
+
 st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666; padding: 2rem;'>
-    <p>🌿 Ayurvedic AI Assistant v3.0</p>
-    <p>Agentic RAG • Advanced Reranking • Conversational Memory</p>
-    <p><em>For educational purposes only</em></p>
-</div>
-""", unsafe_allow_html=True)
+st.caption("Ayurvedic AI Assistant • Agentic RAG • For educational purposes only")
