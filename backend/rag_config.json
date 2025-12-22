@@ -1,5 +1,0 @@
-{
-  "pinecone_api_key": "pcsk_6rFAor_3SASVJcpbNPDQtqu6fBsVzMb9nR6BTYbGrYjoEeLwsRvyh2fd4dCfpK6K63EBMz",
-  "pinecone_index": "ayurveda-rag-v2",
-  "model_name": "meta-llama/Meta-Llama-3-8B"
-}
